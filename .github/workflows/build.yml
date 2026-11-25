@@ -1,0 +1,122 @@
+name: Build RAVEX AI Civilization
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Installs Gradle 8.10.2 itself, so no gradle-wrapper.jar is needed in the repo.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: gradle clean build
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle clean build --stacktrace --console=plain 2>&1 | tee build.log
+
+      - name: Unit test summary
+        if: always()
+        shell: bash
+        run: |
+          # Reporting only: never fails by itself and never hides a real failure.
+          # (The build step above fails on compile errors; the last step fails on failed tests.)
+          set +e
+          shopt -s nullglob
+          FAIL_NOTE=""
+          files=(build/test-results/test/*.xml)
+          {
+            echo "## Unit tests"
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "**Tests did not run** - no result files exist. This is expected if compilation failed; see the build step."
+            else
+              total=$(cat "${files[@]}" | grep -o -E '<testcase[ >/]' | wc -l)
+              failed=$(cat "${files[@]}" | grep -o -E '<failure[ >/]' | wc -l)
+              errors=$(cat "${files[@]}" | grep -o -E '<error[ >/]' | wc -l)
+              echo "Tests ran: $total test cases, $failed failed, $errors errored."
+              echo "(Pure logic only: offline command parsing, language detection, flight/combat math.)"
+              if [ "$failed" -gt 0 ] || [ "$errors" -gt 0 ]; then
+                echo "**$failed test(s) failed, $errors errored - see the build-logs artifact.**"
+                FAIL_NOTE="$failed unit test(s) failed and $errors errored - see the build-logs artifact"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # workflow commands only work on stdout, so print the annotation here (outside the summary redirect)
+          if [ -n "$FAIL_NOTE" ]; then echo "::error::$FAIL_NOTE"; fi
+          exit 0
+
+      - name: Report failure
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Build FAILED"
+            echo "Download the 'build-logs' artifact for the full log. Last 40 lines:"
+            echo '```'
+            tail -n 40 build.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compiled JAR
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ravex-ai-civilization-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+      - name: Package source ZIP
+        if: always()
+        shell: bash
+        run: zip -r ravex-ai-civilization-source.zip . -x ".git/*" "build/*" ".gradle/*" "*.zip"
+
+      - name: Upload source ZIP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ravex-ai-civilization-source
+          path: ravex-ai-civilization-source.zip
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build.log
+            build/reports/**
+            build/test-results/**
+          if-no-files-found: ignore
+
+      - name: Fail the job if any unit test failed
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          shopt -s nullglob
+          files=(build/test-results/test/*.xml)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No unit test results (tests did not run). Nothing to evaluate here."
+            exit 0
+          fi
+          bad=$(cat "${files[@]}" | grep -o -E '<(failure|error)[ >/]' | wc -l)
+          if [ "$bad" -gt 0 ]; then
+            echo "::error::$bad unit test failure(s)/error(s). The JAR artifact was still uploaded for inspection, but this build is NOT green."
+            exit 1
+          fi
+          echo "All unit tests passed."
